@@ -8,6 +8,10 @@
     Polling (instead of reacting only to PIA change events) also covers qBittorrent being restarted,
     started late, or not running at the moment PIA's port changed.
 
+    It also keeps qBittorrent connected across PIA reconnects: when the VPN IP changes, or qBittorrent
+    reports no connectivity, it makes qBittorrent reopen its listening sockets, and restarts qBittorrent
+    as a last resort.
+
 .EXAMPLE
     .\Sync-PiaQbtPort.ps1 -Once
     Runs a single check and exits (handy for testing).
@@ -28,6 +32,15 @@ param(
 
     # Defaults to sync.log next to this script.
     [string]$LogFile,
+
+    # If qBittorrent reports no connectivity for this long, reopen its listening sockets.
+    [int]$RebindAfterSeconds = 60,
+
+    # If it's still stalled this long after first stalling, restart qBittorrent (at most every 15 minutes).
+    [int]$RestartAfterSeconds = 240,
+
+    # Never restart qBittorrent; only reopen its listening sockets.
+    [switch]$NoRestart,
 
     # Run one check and exit.
     [switch]$Once
@@ -128,9 +141,72 @@ function Get-QbtPreferences {
     }
 }
 
-function Set-QbtPort([int]$Port) {
-    $json = @{ listen_port = $Port; random_port = $false } | ConvertTo-Json -Compress
+function Set-QbtPrefs([hashtable]$Prefs) {
+    $json = $Prefs | ConvertTo-Json -Compress
     Invoke-Qbt '/api/v2/app/setPreferences' @{ json = $json } | Out-Null
+}
+
+function Reset-QbtListen([int]$Port) {
+    # qBittorrent only works out the bound interface's IP address when it (re)opens its listening
+    # sockets. After a PIA reconnect the VPN adapter has a new IP, so qBittorrent keeps listening on a
+    # dead address. Bouncing the port forces it to reopen the sockets without ever unbinding from the VPN.
+    $tmp = if ($Port -lt 65535) { $Port + 1 } else { $Port - 1 }
+    Set-QbtPrefs @{ listen_port = $tmp }
+    Start-Sleep -Seconds 3
+    Set-QbtPrefs @{ listen_port = $Port; random_port = $false }
+}
+
+function Restart-Qbt {
+    $proc = Get-Process qbittorrent -ErrorAction SilentlyContinue | Select-Object -First 1
+    if (-not $proc -or -not $proc.Path) {
+        Write-Log "Can't restart qBittorrent: process not found (or running as another user)."
+        return
+    }
+    $exe = $proc.Path
+    try { Invoke-Qbt '/api/v2/app/shutdown' | Out-Null } catch { }
+    # Give it time to save resume data. Never kill it, so no torrent state is lost.
+    if (-not $proc.WaitForExit(120000)) {
+        Write-Log "qBittorrent didn't exit within 2 minutes; not restarting."
+        return
+    }
+    Start-Sleep -Seconds 2
+    Start-Process -FilePath $exe
+    $script:Session = $null
+    Write-Log "Restarted qBittorrent."
+}
+
+function Test-QbtHealth($Prefs, [int]$Port) {
+    $info = (Invoke-Qbt '/api/v2/transfer/info') | ConvertFrom-Json
+    $status = "$($info.connection_status), DHT nodes: $($info.dht_nodes)"
+    if ($status -ne $script:LastHealth) { Write-Log "qBittorrent connection status: $status" }
+    $script:LastHealth = $status
+
+    # "disconnected" means libtorrent has no working listen socket. Zero DHT nodes (with DHT on) means
+    # nothing is getting in or out. "firewalled" alone is normal until the first incoming connection.
+    $stalled = $info.connection_status -eq 'disconnected' -or ($Prefs.dht -and [int]$info.dht_nodes -eq 0)
+    if (-not $stalled) {
+        $script:StalledSince = $null
+        $script:Rebound = $false
+        return
+    }
+
+    if (-not $script:StalledSince) { $script:StalledSince = Get-Date }
+    $stalledFor = ((Get-Date) - $script:StalledSince).TotalSeconds
+
+    if (-not $script:Rebound -and $stalledFor -ge $RebindAfterSeconds) {
+        Write-Log "qBittorrent looks stalled for $([int]$stalledFor)s; reopening its listening sockets."
+        Reset-QbtListen $Port
+        $script:Rebound = $true
+    } elseif ($script:Rebound -and $stalledFor -ge $RestartAfterSeconds -and -not $NoRestart) {
+        $sinceRestart = if ($script:LastRestart) { ((Get-Date) - $script:LastRestart).TotalMinutes } else { [double]::MaxValue }
+        if ($sinceRestart -ge 15) {
+            Write-Log "qBittorrent still stalled after $([int]$stalledFor)s; restarting it."
+            $script:LastRestart = Get-Date
+            Restart-Qbt
+            $script:StalledSince = $null
+            $script:Rebound = $false
+        }
+    }
 }
 
 function Sync-Once {
@@ -138,19 +214,26 @@ function Sync-Once {
     if ($piaPort -isnot [int]) {
         if ($script:LastStatus -ne "pia:$piaPort") { Write-Log "PIA port forward not available: $piaPort" }
         $script:LastStatus = "pia:$piaPort"
+        $script:StalledSince = $null
         return
     }
+    $vpnIp = (& $PiactlPath get vpnip 2>&1 | Out-String).Trim()
 
     $prefs = Get-QbtPreferences
-    if ([int]$prefs.listen_port -eq $piaPort) {
-        if ($script:LastStatus -ne "ok:$piaPort") { Write-Log "qBittorrent already listening on PIA port $piaPort" }
-        $script:LastStatus = "ok:$piaPort"
-        return
+    if ([int]$prefs.listen_port -ne $piaPort) {
+        # Changing the port also reopens the listening sockets, so this covers a reconnect too.
+        Set-QbtPrefs @{ listen_port = $piaPort; random_port = $false }
+        Write-Log "Updated qBittorrent listening port $($prefs.listen_port) -> $piaPort"
+    } elseif ($script:LastVpnIp -and $vpnIp -ne $script:LastVpnIp) {
+        Write-Log "PIA reconnected (VPN IP changed); reopening qBittorrent's listening sockets on port $piaPort."
+        Reset-QbtListen $piaPort
+    } elseif ($script:LastStatus -ne "ok:$piaPort") {
+        Write-Log "qBittorrent already listening on PIA port $piaPort"
     }
-
-    Set-QbtPort $piaPort
-    Write-Log "Updated qBittorrent listening port $($prefs.listen_port) -> $piaPort"
+    $script:LastVpnIp = $vpnIp
     $script:LastStatus = "ok:$piaPort"
+
+    Test-QbtHealth $prefs $piaPort
 }
 
 if (-not (Test-Path $PiactlPath)) {
@@ -160,6 +243,11 @@ if (-not (Test-Path $PiactlPath)) {
 
 Write-Log "Starting PIA -> qBittorrent port sync (qBittorrent: $QbtUrl, every ${IntervalSeconds}s)"
 $script:LastStatus = ''
+$script:LastHealth = ''
+$script:LastVpnIp = ''
+$script:StalledSince = $null
+$script:Rebound = $false
+$script:LastRestart = $null
 while ($true) {
     try {
         Sync-Once

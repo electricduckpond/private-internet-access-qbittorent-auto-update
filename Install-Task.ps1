@@ -16,6 +16,9 @@ param(
 
     [int]$IntervalSeconds = 30,
 
+    # Never restart qBittorrent when it stalls; only reopen its listening sockets.
+    [switch]$NoRestart,
+
     [string]$TaskName = 'PIA qBittorrent Port Sync'
 )
 
@@ -32,6 +35,7 @@ if (-not $NoCredential) {
 }
 
 $taskArgs = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$script`" -QbtUrl `"$QbtUrl`" -IntervalSeconds $IntervalSeconds"
+if ($NoRestart) { $taskArgs += ' -NoRestart' }
 $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument $taskArgs -WorkingDirectory $PSScriptRoot
 $trigger = New-ScheduledTaskTrigger -AtLogOn -User "$env:USERDOMAIN\$env:USERNAME"
 $settings = New-ScheduledTaskSettingsSet `
